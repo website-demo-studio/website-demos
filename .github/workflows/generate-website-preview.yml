@@ -1,0 +1,248 @@
+name: Generate website email preview
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/*/*/index.html"
+
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Website category"
+        required: true
+        type: choice
+        options:
+          - clinics
+          - restaurants
+          - spas
+          - salons
+          - other
+
+      slug:
+        description: "Published website slug, for example dr-aanya-mehra"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: website-preview-main
+  cancel-in-progress: false
+
+jobs:
+  generate-preview:
+    name: Generate email screenshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Determine website files
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            files="docs/${{ inputs.category }}/${{ inputs.slug }}/index.html"
+
+            if [[ ! -f "$files" ]]; then
+              echo "Website file not found: $files"
+              exit 1
+            fi
+          else
+            before="${{ github.event.before }}"
+            after="${{ github.sha }}"
+
+            if [[ "$before" == "0000000000000000000000000000000000000000" ]]; then
+              files="$(
+                git show --pretty="" --name-only "$after" |
+                grep -E '^docs/[^/]+/[^/]+/index\.html$' || true
+              )"
+            else
+              files="$(
+                git diff --name-only "$before" "$after" |
+                grep -E '^docs/[^/]+/[^/]+/index\.html$' || true
+              )"
+            fi
+          fi
+
+          if [[ -z "${files:-}" ]]; then
+            echo "No website index files require screenshots."
+            echo "files=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "The following files will be captured:"
+          echo "$files"
+
+          {
+            echo "files<<EOF"
+            echo "$files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Playwright and Chromium
+        if: steps.targets.outputs.files != ''
+        shell: bash
+        run: |
+          npm install --no-save playwright@1
+          npx playwright install --with-deps chromium
+
+      - name: Start local website server
+        if: steps.targets.outputs.files != ''
+        shell: bash
+        run: |
+          python3 -m http.server 8000 --directory docs > /tmp/preview-server.log 2>&1 &
+          echo $! > /tmp/preview-server.pid
+
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/ > /dev/null; then
+              echo "Local website server is ready."
+              exit 0
+            fi
+
+            sleep 1
+          done
+
+          echo "Local website server failed to start."
+          cat /tmp/preview-server.log
+          exit 1
+
+      - name: Capture email previews
+        if: steps.targets.outputs.files != ''
+        shell: bash
+        env:
+          TARGET_FILES: ${{ steps.targets.outputs.files }}
+        run: |
+          cat > /tmp/capture-preview.cjs <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const { chromium } = require("playwright");
+
+          async function main() {
+            const files = String(process.env.TARGET_FILES || "")
+              .split(/\r?\n/)
+              .map((value) => value.trim())
+              .filter(Boolean);
+
+            if (files.length === 0) {
+              console.log("No target files supplied.");
+              return;
+            }
+
+            const browser = await chromium.launch({ headless: true });
+
+            try {
+              for (const file of files) {
+                if (!fs.existsSync(file)) {
+                  throw new Error(`Website file does not exist: ${file}`);
+                }
+
+                const websiteDirectory = path.dirname(file);
+                const relativeDirectory = websiteDirectory
+                  .replace(/^docs[\\/]/, "")
+                  .split(path.sep)
+                  .map(encodeURIComponent)
+                  .join("/");
+
+                const pageUrl =
+                  `http://127.0.0.1:8000/${relativeDirectory}/`;
+
+                const outputFile = path.join(
+                  websiteDirectory,
+                  "preview-email.jpg"
+                );
+
+                const page = await browser.newPage({
+                  viewport: {
+                    width: 1280,
+                    height: 800
+                  },
+                  deviceScaleFactor: 1
+                });
+
+                await page.emulateMedia({ media: "screen" });
+
+                await page.goto(pageUrl, {
+                  waitUntil: "domcontentloaded",
+                  timeout: 30000
+                });
+
+                await page
+                  .waitForFunction(
+                    () =>
+                      Array.from(document.images).every(
+                        (image) => image.complete
+                      ),
+                    { timeout: 5000 }
+                  )
+                  .catch(() => {});
+
+                await page
+                  .evaluate(() => document.fonts && document.fonts.ready)
+                  .catch(() => {});
+
+                await page.waitForTimeout(1500);
+
+                await page.screenshot({
+                  path: outputFile,
+                  type: "jpeg",
+                  quality: 85,
+                  fullPage: false
+                });
+
+                await page.close();
+
+                console.log(`Created ${outputFile}`);
+              }
+            } finally {
+              await browser.close();
+            }
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+          node /tmp/capture-preview.cjs
+
+      - name: Commit generated previews
+        if: steps.targets.outputs.files != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' file; do
+            git add -- "$file"
+          done < <(
+            find docs -type f -name "preview-email.jpg" -print0
+          )
+
+          if git diff --cached --quiet; then
+            echo "No screenshot changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Generate website email preview"
+
+          git pull --rebase origin main
+          git push origin HEAD:main
